@@ -1,0 +1,161 @@
+# Full Data Description
+
+## Data Preparation, Modeling & KPI Layer
+
+### Data source
+
+The project uses the **GA4 Obfuscated Sample E-commerce dataset** available in BigQuery  
+(`bigquery-public-data.ga4_obfuscated_sample_ecommerce`).
+
+The dataset contains **event-level GA4 data** with nested structures, partial obfuscation, and known real-world limitations (e.g. incomplete event coverage for certain periods).
+
+---
+
+## Data preparation overview
+
+The data preparation pipeline was designed to:
+
+- transform raw GA4 event data into an **analysis-ready session model**
+- enforce a **single row per session** grain for funnel analysis
+- handle data quality issues related to **session duplication across dates**
+- create a stable foundation for **marketing and product KPIs**
+
+The pipeline follows a standard analytics architecture:
+
+**raw events → staging → session mart → deduplicated mart → enriched analytical views → KPI views**
+
+---
+
+## 1. Event staging (`events_flat`)
+
+A staging table was created to flatten raw GA4 events and extract key fields.
+
+### Key transformations
+- flatten nested GA4 structures
+- extract `ga_session_id` and `ga_session_number`
+- standardize acquisition, device, and geo dimensions
+- keep event-level granularity for traceability
+
+Only events with a valid `ga_session_id` were retained.
+
+**Timeframe applied at this stage:**  
+`01.12.2020 – 31.01.2021`
+
+---
+
+## 2. Session-level mart (`sessions_funnel`)
+
+From the staging layer, a session-level table was built.
+
+### Characteristics
+- one row per `(event_date, session_key, user)`
+- binary funnel flags:
+  - `view_item`
+  - `add_to_cart`
+  - `begin_checkout`
+  - `purchase`
+- session-level revenue aggregation
+- session metadata (source, medium, campaign, device, country)
+
+At this stage, sessions could still appear on **multiple rows** due to date boundaries.
+
+---
+
+## 3. Deduplication and session grain enforcement
+
+During validation, duplicate `session_key` values were observed in `sessions_funnel` (268 duplicated sessions).
+
+This occurred because **a single GA4 session can span multiple calendar dates**, and the mart grouped by `event_date`.
+
+This would bias:
+- session counts
+- funnel step counts
+- conversion rates
+
+### Deduplication approach
+
+A final session-level table (`sessions_funnel_deduped`) was created by:
+- grouping strictly by `session_key`
+- assigning `session_date` as the **earliest event date in the session**
+- aggregating funnel flags using `MAX`
+- aggregating revenue at the session level
+- retaining one row per session
+
+This enforces a **true one-row-per-session grain**, required for correct funnel analysis.
+
+---
+
+## 4. Enrichment (`channel_group`)
+
+An enrichment step was applied to derive a simplified `channel_group` from `medium`, improving dashboard readability and acquisition analysis.
+
+The enriched table was named `sessions_funnel_final`.
+
+Example channel groups:
+- Paid Search
+- Paid Social
+- Organic Search
+- Referral
+- Direct
+- Other
+
+---
+
+## 5. Timeframe selection and data quality
+
+### Final analysis window
+**01.12.2020 – 31.01.2021**
+
+Exploratory data quality checks revealed periods with incomplete `add_to_cart` tracking.
+
+To avoid biased funnel metrics, the analysis was restricted to a **stable two-month window (December 2020 – January 2021)** with consistent coverage across all funnel steps.
+
+This reflects standard analytics practice where data quality validation precedes reporting.
+
+### Rationale
+
+Earlier periods contained **incomplete `add_to_cart` tracking**, while downstream funnel events were still present. Using those periods would distort funnel drop-off rates.
+
+The selected two-month window:
+- provides **consistent coverage across all funnel steps**
+- offers sufficient volume for channel comparison
+- balances data quality with sample size
+
+---
+
+## 6. KPI layer (views)
+
+All KPIs are implemented as **views** built on top of the session-level data.
+
+### Tables and views
+- Core fact table: `sessions_funnel_deduped`
+- Enriched analytical view: `sessions_funnel_final`
+- KPI views:
+  - `kpi_by_date`
+  - `kpi_by_source_medium`
+  - `kpi_by_campaign`
+  - `kpi_by_device`
+  - `kpi_by_user_type`
+
+This approach ensures:
+- consistent metric definitions
+- no data duplication
+- clear separation between data preparation and reporting logic
+
+### Key KPIs
+- sessions
+- purchase sessions
+- session conversion rate (CVR)
+- revenue
+- revenue per session
+- funnel step conversion rates:
+  - view → cart
+  - cart → checkout
+  - checkout → purchase
+
+Using views ensures centralised definitions and consistent numbers across dashboards.
+
+---
+
+## Final data model
+
