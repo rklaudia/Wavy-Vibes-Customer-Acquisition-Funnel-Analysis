@@ -1,0 +1,105 @@
+# **Wavy Vibes: Customer Acquisition Funnel Analysis (E-commerce)**
+
+# Summary
+
+Wavy Vibes is an Australian surf e-commerce store looking to understand why strong traffic isn’t translating into sales. I used GA4 event data to model the full marketing funnel at the session level and built a diagnostic dashboard covering acquisition, funnel drop-offs, campaigns, devices, and audiences. The analysis was powered by BigQuery for data modeling and Looker Studio for visualisation, with a focus on correct aggregation and funnel step rates. The results showed that the biggest losses happen early in the funnel, that traffic quality varies significantly by channel, and that returning users drive disproportionate value. The project concludes with clear, data-backed recommendations on where to optimise and what to test next.
+
+# Problem
+
+**Wavy Vibes** is an Australian surf e-commerce store selling boards, apparel, and accessories to a highly seasonal and competitive market. Traffic comes in waves - from paid search, social campaigns, and organic discovery - but the team doesn’t have a clear picture of what actually happens after visitors land on the site. Some browse boards, some add items to cart, and only a fraction make it to checkout and purchase.
+
+This matters because every lost step in the funnel means wasted marketing spend or missed revenue, especially during peak surf season. The **marketing team** wants to know which channels truly drive value, while the **e-commerce team** needs to understand where users drop off and why.
+
+The scope of this project is a **session-based GA4 funnel analysis** that follows users from product view to purchase. The goal is to give Wavy Vibes a clear, decision-ready view of its marketing funnel - showing where the waves carry customers forward and where they quietly fade out.
+
+# Inputs
+
+This project uses **Google Analytics 4 (GA4) event data** from an e-commerce website, accessed directly via **BigQuery**. The data captures user interactions across the full marketing and purchase funnel, including product views, add-to-cart actions, checkout starts, and purchases. No additional APIs or user-uploaded datasets were used; GA4 is the single source of input data.
+
+The dataset includes multiple data types: event-level behavioural data with timestamps, anonymised user and session identifiers, categorical dimensions such as source, medium, campaign, device category, and country, boolean session-level funnel flags, numerical measures including revenue and conversion metrics, and temporal fields for event and session dates.
+
+# Discovery
+
+I started by validating the data structure and event coverage, checking daily volumes for key funnel steps (`view_item`, `add_to_cart`, `begin_checkout`, `purchase`) and comparing total rows to distinct `session_key` values to confirm the session grain.
+
+During cleanup, I enforced a single row per session by deduplicating sessions that appeared on multiple dates (sessions spanning midnight) and restricted the analysis window to **December 2020–January 2021** after identifying periods with incomplete `add_to_cart` tracking that distorted funnel rates.
+
+Initially, I expected funnel steps to be strictly monotonic (view → cart → checkout → purchase) across all days; this hypothesis did not hold for some earlier windows due to tracking gaps rather than user behaviour.
+
+These exploratory checks informed the final timeframe selection and ensured that all KPI views were built on a stable, validated session-level dataset.
+
+# Execution
+
+This project focuses on turning raw GA4 data into actionable marketing insights around acquisition performance and funnel drop-offs.
+
+GA4 exports are event-based, so the first step was to model the data at the **session level**, which is the right grain for analysing conversion, revenue, and funnel efficiency. Events were stitched into sessions using a deterministic session key based on the user identifier and GA4 session ID.
+
+```sql
+CONCAT(user_pseudo_id,'-',CAST(ga_session_idAS STRING))AS session_key
+```
+
+During exploration, I identified sessions that appeared across multiple dates (for example, sessions spanning midnight). These were merged into a single record to avoid inflated session counts and misleading conversion rates.
+
+```sql
+SELECT
+  session_key,
+MIN(event_date)AS session_date,
+MAX(has_purchase)AS has_purchase,
+SUM(revenue)AS revenue
+FROM sessions_funnel
+GROUPBY session_key
+```
+
+All marketing KPIs were calculated as **ratios of summed counts**, not averages of pre-aggregated rates. This ensures that conversion rates and revenue metrics remain correct when filtering by time, channel, or device.
+
+```sql
+SAFE_DIVIDE(SUM(has_purchase),COUNT(*))AS session_cvr
+```
+
+To support funnel optimisation, I introduced a *weakest funnel step* metric at the channel level, making it easy to see where users drop off most and which channels require attention.
+
+```
+NARY_MIN(view_to_cart_rate, cart_to_checkout_rate, checkout_to_purchase_rate)
+```
+
+BigQuery was used for data preparation, session modelling, and KPI views, while Looker Studio was used for aggregation, segmentation, and visual analysis. Full SQL models and data checks are stored in GitHub, with only the most impactful logic highlighted here (80/20 rule).
+
+### Key Takeaways
+
+**Top 3 Insights**
+
+**1. Conversion efficiency is the main growth opportunity**
+
+Wavy Vibes generates strong traffic volume, but very few sessions convert. Improving funnel efficiency would have a larger impact on revenue than increasing acquisition.
+
+**2. The biggest losses happen early in the funnel**
+
+The View → Cart step is consistently the weakest part of the funnel, especially for high-volume channels. This points to issues with product discovery, relevance, or intent rather than checkout friction.
+
+**3. Returning users drive disproportionate value**
+
+Returning users convert several times better and generate significantly higher revenue per session than new users, making retention one of the strongest growth levers.
+
+### Top 3 Recommendations
+
+**1. Focus optimisation on product discovery and early engagement**
+
+Prioritise experiments on product pages, landing pages, and merchandising to improve View → Cart performance.
+
+**2. Shift acquisition toward higher-intent traffic**
+
+Reallocate effort toward channels and sources that show stronger revenue per session, even if their traffic volume is smaller.
+
+**3. Invest in retention and remarketing**
+
+Build strategies around returning users through email, loyalty, and personalised experiences to maximise long-term value.
+
+# Results
+
+This project set out to understand where Wavy Vibes is losing customers in the marketing funnel-and it delivered a clear answer. The biggest opportunity isn’t more traffic, but better conversion, especially early in the funnel and among new users.
+
+I completed everything I planned: modeling GA4 data at the session level, fixing real data quality issues, and building a dashboard that explains performance by channel, campaign, and audience. Along the way, limitations like inconsistent campaign tagging shaped how deep campaign-level insights could go.
+
+If it was a real production project, I would involve marketing stakeholders earlier to align on KPIs and tracking standards, and formalise the setup with version control, access management, and data quality checks.
+
+The next step would be experimentation. The analysis points directly to what to test next: improving product discovery, reducing mid-funnel friction for referral traffic, and investing in retention for returning users.
