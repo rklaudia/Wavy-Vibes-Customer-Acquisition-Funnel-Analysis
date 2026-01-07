@@ -97,8 +97,8 @@ Performance comparison by device category and new vs. returning users.
 
 ## Repository Contents
 
-/sql – BigQuery models and KPI views
-/docs – data preparation notes and assumptions
-/dashboard – Looker Studio dashboard link
+- /sql – BigQuery models and KPI views
+- /docs – data preparation notes and assumptions
+- /dashboard – Looker Studio dashboard link
 
 This project demonstrates an end-to-end marketing analytics workflow: from raw GA4 data to actionable insights and clear optimisation priorities.
