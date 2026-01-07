@@ -1,0 +1,218 @@
+- **table: events_flat**
+
+```python
+CREATE OR REPLACE TABLE `funnel-analysis-482106.analytics.events_flat` AS
+WITH base AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', event_date) AS event_date,
+    event_timestamp,
+    user_pseudo_id,
+    event_name,
+
+    -- Extract GA4 session id from event_params
+    (SELECT ep.value.int_value
+     FROM UNNEST(event_params) ep
+     WHERE ep.key = 'ga_session_id') AS ga_session_id,
+
+    -- Optional: session number (useful for new/returning proxies)
+    (SELECT ep.value.int_value
+     FROM UNNEST(event_params) ep
+     WHERE ep.key = 'ga_session_number') AS ga_session_number,
+
+    -- Traffic source (fields may differ by dataset; keep what exists)
+    traffic_source.source AS source,
+    traffic_source.medium AS medium,
+    traffic_source.name   AS campaign,
+
+    device.category AS device_category,
+    geo.country     AS country,
+
+    -- Ecommerce revenue (may be null except on purchase events)
+    ecommerce.purchase_revenue AS purchase_revenue
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+  WHERE _TABLE_SUFFIX BETWEEN '20201201' AND '20210131'
+)
+SELECT
+  *,
+  CONCAT(user_pseudo_id, '-', CAST(ga_session_id AS STRING)) AS session_key
+FROM base
+WHERE ga_session_id IS NOT NULL;
+```
+
+- **table: funnel_sessions**
+
+```python
+CREATE OR REPLACE TABLE `funnel-analysis-482106.analytics.sessions_funnel` AS
+SELECT
+  event_date,
+  session_key,
+  user_pseudo_id,
+
+  -- Attribution choice (simple, explainable): first observed source/medium/campaign in the session window
+  ANY_VALUE(source)   AS source,
+  ANY_VALUE(medium)   AS medium,
+  ANY_VALUE(campaign) AS campaign,
+
+  ANY_VALUE(device_category) AS device_category,
+  ANY_VALUE(country)         AS country,
+
+  -- Funnel step flags (session-level)
+  MAX(IF(event_name = 'view_item', 1, 0))        AS has_view_item,
+  MAX(IF(event_name = 'add_to_cart', 1, 0))      AS has_add_to_cart,
+  MAX(IF(event_name = 'begin_checkout', 1, 0))   AS has_begin_checkout,
+  MAX(IF(event_name = 'purchase', 1, 0))         AS has_purchase,
+
+  -- Revenue per session (sum, but usually one purchase event)
+  SUM(IFNULL(purchase_revenue, 0)) AS revenue,
+
+  -- Optional new/returning proxy from session number
+  MIN(ga_session_number) AS ga_session_number
+FROM `funnel-analysis-482106.analytics.events_flat`
+GROUP BY 1, 2, 3;
+```
+
+- **table: sessions_funnel_dedup**
+
+```python
+CREATE OR REPLACE TABLE `funnel-analysis-482106.analytics.sessions_funnel_deduped` AS
+SELECT
+  MIN(event_date) AS session_date,
+  session_key,
+  ANY_VALUE(user_pseudo_id) AS user_pseudo_id,
+
+  -- keep attribution stable (this is a pragmatic choice given your existing mart)
+  ANY_VALUE(source) AS source,
+  ANY_VALUE(medium) AS medium,
+  
+  ANY_VALUE(campaign) AS campaign,
+  ANY_VALUE(device_category) AS device_category,
+  ANY_VALUE(country) AS country,
+
+  -- funnel flags: if any row has the step, the session has it
+  MAX(has_view_item) AS has_view_item,
+  MAX(has_add_to_cart) AS has_add_to_cart,
+  MAX(has_begin_checkout) AS has_begin_checkout,
+  MAX(has_purchase) AS has_purchase,
+
+  -- revenue: see note below
+  SUM(revenue) AS revenue,
+
+  MIN(ga_session_number) AS ga_session_number
+FROM `funnel-analysis-482106.analytics.sessions_funnel`
+GROUP BY session_key;
+```
+
+- **table: sessions_funnel_final**
+
+```python
+CREATE OR REPLACE TABLE `funnel-analysis-482106.analytics.sessions_funnel_final` AS
+SELECT *,
+  CASE
+    WHEN medium IN ('cpc','ppc','paidsearch') THEN 'Paid Search'
+    WHEN medium IN ('paid_social','paidsocial','social_paid') THEN 'Paid Social'
+    WHEN medium = 'organic' THEN 'Organic Search'
+    WHEN medium = 'referral' THEN 'Referral'
+    WHEN medium = '(none)' OR medium IS NULL THEN 'Direct'
+    ELSE 'Other'
+  END AS channel_group
+FROM `funnel-analysis-482106.analytics.sessions_funnel_deduped`;
+```
+
+- **view: kpi_by_campaign**
+
+```python
+CREATE OR REPLACE VIEW `funnel-analysis-482106.analytics.kpi_by_campaign` AS
+SELECT
+  campaign,
+  source,
+  medium,
+  channel_group,
+  COUNT(*) AS sessions,
+  SUM(has_purchase) AS purchase_sessions,
+  SAFE_DIVIDE(SUM(has_purchase), COUNT(*)) AS session_cvr,
+  SUM(revenue) AS revenue,
+  SAFE_DIVIDE(SUM(revenue), COUNT(*)) AS revenue_per_session
+FROM `funnel-analysis-482106.analytics.sessions_funnel_final`
+GROUP BY 1, 2, 3,4;
+```
+
+- **view: kpi_by_date**
+
+```
+CREATE OR REPLACE VIEW `funnel-analysis-482106.analytics.kpi_by_date` AS
+SELECT  
+	session_date,  
+	COUNT(*) AS sessions,  
+	SUM(has_purchase) AS purchase_sessions,  
+	SAFE_DIVIDE(SUM(has_purchase), 
+	COUNT(*)) AS session_cvr,  
+	SUM(revenue) AS revenue,  
+	SAFE_DIVIDE(SUM(revenue), 
+	COUNT(*)) AS revenue_per_session,  
+	SUM(has_view_item) AS view_sessions,  
+	SUM(has_add_to_cart) AS cart_sessions,  
+	SUM(has_begin_checkout) AS checkout_sessions,  
+	SAFE_DIVIDE(SUM(has_add_to_cart), NULLIF(SUM(has_view_item), 0)) AS view_to_cart_rate,  
+	SAFE_DIVIDE(SUM(has_begin_checkout), NULLIF(SUM(has_add_to_cart), 0)) AS cart_to_checkout_rate,  
+	SAFE_DIVIDE(SUM(has_purchase), NULLIF(SUM(has_begin_checkout), 0)) AS checkout_to_purchase_rate
+FROM `funnel-analysis-482106.analytics.sessions_funnel_final`
+	GROUP BY 1;
+```
+
+- **view: kpi_by_device**
+
+```
+CREATE OR REPLACE VIEW `funnel-analysis-482106.analytics.kpi_by_device` AS
+SELECT
+  device_category,
+  COUNT(*) AS sessions,
+  SUM(has_purchase) AS purchase_sessions,
+  SAFE_DIVIDE(SUM(has_purchase), COUNT(*)) AS session_cvr,
+  SUM(revenue) AS revenue,
+  SAFE_DIVIDE(SUM(revenue), COUNT(*)) AS revenue_per_session,
+
+  SAFE_DIVIDE(SUM(has_add_to_cart), NULLIF(SUM(has_view_item), 0)) AS view_to_cart_rate,
+  SAFE_DIVIDE(SUM(has_purchase), NULLIF(SUM(has_begin_checkout), 0)) AS checkout_to_purchase_rate
+FROM `funnel-analysis-482106.analytics.sessions_funnel_final`
+GROUP BY 1;
+
+```
+
+- **view: kpi_by_user_type**
+
+```
+CREATE OR REPLACE VIEW `funnel-analysis-482106.analytics.kpi_by_user_type` AS
+SELECT
+  IF(ga_session_number = 1, 'new', 'returning') AS user_type,
+  COUNT(*) AS sessions,
+  SUM(has_purchase) AS purchase_sessions,
+  SAFE_DIVIDE(SUM(has_purchase), COUNT(*)) AS session_cvr,
+  SUM(revenue) AS revenue,
+  SAFE_DIVIDE(SUM(revenue), COUNT(*)) AS revenue_per_session
+FROM `funnel-analysis-482106.analytics.sessions_funnel_final`
+GROUP BY 1;
+```
+
+- **view: kpi_by_source_medium**
+
+```
+CREATE OR REPLACE VIEW `funnel-analysis-482106.analytics.kpi_by_source_medium` AS
+SELECT
+  source,
+  medium,
+  channel_group,
+  COUNT(*) AS sessions,
+  SUM(has_purchase) AS purchase_sessions,
+  SAFE_DIVIDE(SUM(has_purchase), COUNT(*)) AS session_cvr,
+  SUM(revenue) AS revenue,
+  SAFE_DIVIDE(SUM(revenue), COUNT(*)) AS revenue_per_session,
+  SUM(has_view_item) AS view_sessions,
+  SUM(has_add_to_cart) AS cart_sessions,
+  SUM(has_begin_checkout) AS checkout_sessions,
+
+  SAFE_DIVIDE(SUM(has_add_to_cart), NULLIF(SUM(has_view_item), 0)) AS view_to_cart_rate,
+  SAFE_DIVIDE(SUM(has_begin_checkout), NULLIF(SUM(has_add_to_cart), 0)) AS cart_to_checkout_rate,
+  SAFE_DIVIDE(SUM(has_purchase), NULLIF(SUM(has_begin_checkout), 0)) AS checkout_to_purchase_rate
+FROM `funnel-analysis-482106.analytics.sessions_funnel_final`
+GROUP BY 1, 2, 3;
+```
